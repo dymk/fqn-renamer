@@ -16,13 +16,13 @@ use tui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, TextInput},
+    widgets::{Block, Borders, List, ListItem, Paragraph, TextInput},
     Frame, Terminal,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
     // main argument parsing
-    let base_dir = env::args().next().expect("arg0: base dir to search");
+    let base_dir = env::args().nth(1).unwrap_or(".".to_owned());
 
     // setup terminal
     enable_raw_mode()?;
@@ -103,7 +103,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .constraints(
             [
                 // inputs
-                Constraint::Length(6),
+                Constraint::Length(9),
                 // results
                 Constraint::Min(10),
                 // event log
@@ -114,7 +114,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         .split(f.size());
 
     let inputs_layout = Layout::default()
-        .constraints([Constraint::Length(3), Constraint::Length(3)].as_ref())
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ]
+            .as_ref(),
+        )
         .split(layout[0]);
 
     let default_block = || {
@@ -128,12 +135,22 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             .add_modifier(Modifier::BOLD)
     };
 
+    // Base dir input
+    {
+        let base_dir = Paragraph::new(Text::from(app.base_dir.as_str())).block(
+            default_block()
+                .title("Search Directory")
+                .borders(Borders::ALL),
+        );
+        f.render_widget(base_dir, inputs_layout[0]);
+    }
+
     // "Search" input and preview button
     {
         let l = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(10), Constraint::Length(20)].as_ref())
-            .split(inputs_layout[0]);
+            .split(inputs_layout[1]);
 
         let search_input = TextInput::new()
             .block(default_block().title("Search").borders(Borders::ALL))
@@ -155,7 +172,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let l = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(10), Constraint::Length(20)].as_ref())
-            .split(inputs_layout[1]);
+            .split(inputs_layout[2]);
 
         let search_input = TextInput::new()
             .focused_style(focused_style())
@@ -205,7 +222,13 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let e = app.events.lock().unwrap();
         let events = List::new(
             e.iter()
-                .map(|event| ListItem::new(Span::raw(event)))
+                .map(|(idx, event)| {
+                    ListItem::new(Spans::from(vec![
+                        Span::raw(format!("{:>4}", idx)),
+                        Span::raw(" "),
+                        Span::raw(event),
+                    ]))
+                })
                 .collect::<Vec<_>>(),
         )
         .block(Block::default().title("Events").borders(Borders::ALL));
@@ -244,5 +267,6 @@ fn found_match_to_span(found_match: &FoundMatch) -> Text<'_> {
         ]));
     }
 
+    text.lines.push(Spans(vec![]));
     text
 }

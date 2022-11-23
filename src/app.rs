@@ -29,7 +29,7 @@ pub enum SearchState {
 }
 
 pub struct App {
-    base_dir: String,
+    pub base_dir: String,
     pub inputs: Inputs,
     pub events: Arc<Mutex<EventLog>>,
     pub search_state: SearchState,
@@ -81,7 +81,12 @@ impl App {
                 self.found_matches.lock().unwrap().clear();
 
                 let mut proc = Command::new("rg")
-                    .args(&["--json", "-C1", self.inputs.search_for_ident.get_value()])
+                    .args(&[
+                        "--json",
+                        "-C1",
+                        self.inputs.search_for_ident.get_value(),
+                        &self.base_dir,
+                    ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -118,11 +123,18 @@ impl App {
 
     fn kill_worker_thread(&mut self) {
         if let Some(thread) = self.comm_thread.take() {
-            thread.join().unwrap();
-            self.events
-                .lock()
-                .unwrap()
-                .push("Killed worker thread".to_string());
+            match thread.join() {
+                Ok(_) => self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push("Killed worker thread".to_string()),
+                Err(_) => self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push("Error killing worker thread".to_string()),
+            }
         }
     }
 
