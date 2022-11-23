@@ -25,7 +25,7 @@ use tui::{
 
 fn main() -> Result<(), Box<dyn Error>> {
     // main argument parsing
-    let base_dir = env::args().nth(1).unwrap_or(".".to_owned());
+    let base_dir = env::args().nth(1).unwrap_or_else(|| ".".to_owned());
 
     // setup terminal
     enable_raw_mode()?;
@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // create app and run it
     let mut app = App::new(base_dir);
+    app.search_input_submitted();
     let res = run_app(&mut terminal, &mut app);
 
     // restore terminal
@@ -78,8 +79,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             modifiers: KeyModifiers::NONE,
         }) = event
         {
+            // 'enter' key pressed while on search / searching... button => toggle search
             if app.inputs.search_button.is_focused() {
                 app.search_button_submitted();
+            }
+            // 'enter' key pressed while on search input => start search
+            else if app.inputs.search_for_ident.is_focused() {
+                app.search_input_submitted();
             }
         }
 
@@ -119,14 +125,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             continue;
         }
 
-        match event {
-            Event::Key(key) => match key.code {
+        if let Event::Key(key) = event {
+            match key.code {
                 KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc => return Ok(()),
                 KeyCode::Tab => app.inputs.focus_next_input(),
                 KeyCode::BackTab => app.inputs.focus_prev_input(),
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }
@@ -234,8 +240,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let replace_review_l = l[1];
 
         let matches = app.found_matches.lock().unwrap();
-        let num_matches = matches.len();
-        let mut scrollable = RefCell::new(Scrollable::new(app.results_scroll_offset));
+        let num_files = matches.len();
+        let mut scrollable = RefCell::new(Scrollable::new(
+            app.results_scroll_offset,
+            search_results_l.height as usize,
+        ));
 
         let mut first = true;
         for found_match in matches.iter() {
@@ -243,14 +252,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 scrollable.borrow_mut().push(|| Spans::from(vec![]));
             }
             first = false;
-            add_match_to_text(&mut scrollable, found_match);
+            add_match_to_text(&mut scrollable, found_match, 20);
         }
 
         let search_results = Paragraph::new(Text::from(scrollable.take().get())).block(
             Block::default()
                 .title(Spans::from(vec![
                     Span::raw("Search Results "),
-                    Span::raw(format!("({})", num_matches)),
+                    Span::raw(format!("({} files, {} matches)", num_files, num_files)),
                 ]))
                 .borders(Borders::ALL),
         );
@@ -280,9 +289,19 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     }
 }
 
-fn add_match_to_text<'a>(text: &mut RefCell<Scrollable<Spans<'a>>>, found_match: &'a FoundMatch) {
-    text.borrow_mut()
-        .push(|| Spans::from(vec![Span::raw(&found_match.file_path)]));
+fn add_match_to_text<'a>(
+    text: &mut RefCell<Scrollable<Spans<'a>>>,
+    found_match: &'a FoundMatch,
+    results_area_width: usize,
+) {
+    let section_sep = format!("    |{}", "-".repeat(results_area_width - 5));
+
+    text.borrow_mut().push(|| {
+        Spans::from(vec![Span::styled(
+            &found_match.file_path,
+            Style::default().fg(tui::style::Color::Magenta),
+        )])
+    });
 
     let mut prev_line = None;
 
@@ -294,7 +313,7 @@ fn add_match_to_text<'a>(text: &mut RefCell<Scrollable<Spans<'a>>>, found_match:
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {
                 text.borrow_mut()
-                    .push(|| Spans::from(vec![Span::raw("...")]));
+                    .push(|| Spans::from(vec![Span::raw(section_sep.clone())]));
             }
         }
         prev_line = Some(line_num);
@@ -302,7 +321,7 @@ fn add_match_to_text<'a>(text: &mut RefCell<Scrollable<Spans<'a>>>, found_match:
         text.borrow_mut().push(|| {
             Spans::from(vec![
                 Span::styled(
-                    format!("{:>4}: ", line_num),
+                    format!("{:>4}| ", line_num),
                     Style::default().fg(Color::Gray),
                 ),
                 Span::raw(&line[0..start]),

@@ -13,6 +13,7 @@ use crate::event_log::EventLog;
 
 #[tui::macros::interactive_form]
 pub struct Inputs {
+    #[default("com.example.foo.Foo")]
     pub search_for_ident: TextInputState,
     #[default("Search")]
     pub search_button: TextInputState,
@@ -76,6 +77,12 @@ impl App {
         }
     }
 
+    pub fn search_input_submitted(&mut self) {
+        if self.search_state == SearchState::Idle {
+            self.search_button_submitted();
+        }
+    }
+
     pub fn search_button_submitted(&mut self) {
         match self.search_state {
             SearchState::Idle => {
@@ -87,7 +94,7 @@ impl App {
                     .args([
                         "--json",
                         "-C1",
-                        self.inputs.search_for_ident.get_value(),
+                        &format!("\\b{}\\b", self.inputs.search_for_ident.get_value()),
                         &self.base_dir,
                     ])
                     .stdout(Stdio::piped())
