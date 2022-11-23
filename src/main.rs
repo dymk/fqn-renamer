@@ -10,14 +10,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use scrollable::Scrollable;
 
-use std::{
-    cell::{RefCell, RefMut},
-    env,
-    error::Error,
-    io,
-    time::Duration,
-};
+use std::{cell::RefCell, env, error::Error, io, time::Duration};
 use tui::{
     backend::{Backend, CrosstermBackend},
     interactive_form::InteractiveForm,
@@ -240,28 +235,18 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
 
         let matches = app.found_matches.lock().unwrap();
         let num_matches = matches.len();
-        let mut skip_lines = app.results_scroll_offset;
-        let text = RefCell::new(vec![]);
+        let mut scrollable = RefCell::new(Scrollable::new(app.results_scroll_offset));
 
         let mut first = true;
         for found_match in matches.iter() {
             if !first {
-                if skip_lines == 0 {
-                    text.borrow_mut().push(vec![]);
-                }
-                skip_lines = skip_lines.saturating_sub(1);
+                scrollable.borrow_mut().push(|| Spans::from(vec![]));
             }
             first = false;
-
-            {
-                let text = text.borrow_mut();
-                add_match_to_text(&mut skip_lines, text, found_match)
-            }
+            add_match_to_text(&mut scrollable, found_match);
         }
 
-        let text = text.take().into_iter().map(Spans::from).collect::<Vec<_>>();
-
-        let search_results = Paragraph::new(Text::from(text)).block(
+        let search_results = Paragraph::new(Text::from(scrollable.take().get())).block(
             Block::default()
                 .title(Spans::from(vec![
                     Span::raw("Search Results "),
@@ -295,15 +280,9 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     }
 }
 
-fn add_match_to_text<'a>(
-    skip_lines: &mut usize,
-    mut text: RefMut<Vec<Vec<Span<'a>>>>,
-    found_match: &'a FoundMatch,
-) {
-    if *skip_lines == 0 {
-        text.push(vec![Span::raw(&found_match.file_path)]);
-    }
-    *skip_lines = skip_lines.saturating_sub(1);
+fn add_match_to_text<'a>(text: &mut RefCell<Scrollable<Spans<'a>>>, found_match: &'a FoundMatch) {
+    text.borrow_mut()
+        .push(|| Spans::from(vec![Span::raw(&found_match.file_path)]));
 
     let mut prev_line = None;
 
@@ -314,27 +293,22 @@ fn add_match_to_text<'a>(
 
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {
-                if *skip_lines == 0 {
-                    text.push(vec![Span::raw("...")]);
-                }
-                *skip_lines = skip_lines.saturating_sub(1);
+                text.borrow_mut()
+                    .push(|| Spans::from(vec![Span::raw("...")]));
             }
         }
         prev_line = Some(line_num);
 
-        if *skip_lines == 0 {
-            text.push({
-                vec![
-                    Span::styled(
-                        format!("{:>4}: ", line_num),
-                        Style::default().fg(Color::Gray),
-                    ),
-                    Span::raw(&line[0..start]),
-                    Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
-                    Span::raw(&line[end..]),
-                ]
-            });
-        }
-        *skip_lines = skip_lines.saturating_sub(1);
+        text.borrow_mut().push(|| {
+            Spans::from(vec![
+                Span::styled(
+                    format!("{:>4}: ", line_num),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::raw(&line[0..start]),
+                Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
+                Span::raw(&line[end..]),
+            ])
+        });
     }
 }

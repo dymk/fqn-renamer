@@ -1,11 +1,15 @@
+#[derive(Default)]
 pub struct Scrollable<T> {
     offset: usize,
-    vec: Vec<T>
+    vec: Vec<T>,
 }
 
-impl <T> Scrollable<T> {
+impl<T> Scrollable<T> {
     pub fn new(offset: usize) -> Self {
-        Self { offset, vec: vec![] }
+        Self {
+            offset,
+            vec: vec![],
+        }
     }
     pub fn push(&mut self, t: impl FnOnce() -> T) {
         if self.offset > 0 {
