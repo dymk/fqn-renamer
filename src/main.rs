@@ -1,8 +1,11 @@
 mod app;
 mod event_log;
+mod found_match;
+mod fqcn;
+mod rg_worker_thread;
 mod scrollable;
 
-use app::{App, FoundMatch};
+use app::App;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -10,6 +13,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use found_match::FoundMatch;
+use fqcn::Fqcn;
 use scrollable::Scrollable;
 
 use std::{cell::RefCell, env, error::Error, io, time::Duration};
@@ -68,10 +73,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
         let event = event::read()?;
 
         if !matches!(event, Event::Mouse(_)) {
-            app.events
-                .lock()
-                .unwrap()
-                .push(format!("term event: {:?}", event));
+            // app.events.push(format!("term event: {:?}", event));
         }
 
         if let Event::Key(KeyEvent {
@@ -196,6 +198,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let search_input = TextInput::new()
             .block(default_block().title("Search").borders(Borders::ALL))
             .focused_style(focused_style())
+            .styler(make_fqcn_styler())
             .placeholder_text("Identifier or FQCN");
 
         f.render_interactive(search_input, l[0], &app.inputs.search_for_ident);
@@ -218,6 +221,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let search_input = TextInput::new()
             .focused_style(focused_style())
             .block(default_block().title("Replace").borders(Borders::ALL))
+            .styler(make_fqcn_styler())
             .placeholder_text("Identifier or FQCN");
 
         f.render_interactive(search_input, l[0], &app.inputs.replace_with_ident);
@@ -239,7 +243,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let search_results_l = l[0];
         let replace_review_l = l[1];
 
-        let matches = app.found_matches.lock().unwrap();
+        let matches = &app.found_matches;
         let num_files = matches.len();
         let mut scrollable = RefCell::new(Scrollable::new(
             app.results_scroll_offset,
@@ -272,14 +276,23 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     }
 
     {
-        let e = app.events.lock().unwrap();
+        let events_list = app.events.list();
         let events = List::new(
-            e.iter()
-                .map(|(idx, event)| {
+            events_list
+                .iter()
+                .map(|line| {
+                    let num = format!("{:>4}", line.num);
+                    let num = match line.level {
+                        event_log::Level::Info => Span::raw(num),
+                        event_log::Level::Error => {
+                            Span::styled(num, Style::default().fg(Color::Red))
+                        }
+                    };
+
                     ListItem::new(Spans::from(vec![
-                        Span::raw(format!("{:>4}", idx)),
+                        num,
                         Span::raw(" "),
-                        Span::raw(event),
+                        Span::raw(&line.value),
                     ]))
                 })
                 .collect::<Vec<_>>(),
@@ -329,5 +342,19 @@ fn add_match_to_text<'a>(
                 Span::raw(&line[end..]),
             ])
         });
+    }
+}
+
+fn make_fqcn_styler() -> impl FnOnce(bool, &str) -> Spans {
+    |_focused, contents| {
+        if let Some(fqcn) = Fqcn::new(contents) {
+            vec![
+                Span::styled(fqcn.package().to_owned(), Style::default().fg(Color::Green)),
+                Span::styled(fqcn.ident().to_owned(), Style::default().fg(Color::Blue)),
+            ]
+            .into()
+        } else {
+            Span::raw(contents).into()
+        }
     }
 }
