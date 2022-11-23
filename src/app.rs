@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     io::Read,
     mem,
     process::{Child, ChildStdout, Command, Stdio},
@@ -28,6 +29,71 @@ pub enum SearchState {
     Searching,
 }
 
+struct RgThread {
+    command: Vec<String>,
+    pid: u32,
+    process: Child,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RgThread {
+    pub fn new<F, C>(
+        command: &str,
+        args: &[&str],
+        worker_factory: F,
+    ) -> Result<RgThread, Box<dyn Error>>
+    where
+        F: FnOnce(ChildStdout) -> C,
+        C: FnOnce() + Send + 'static,
+    {
+        let mut process = Command::new(command)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = process.id();
+        let child_stdout = process.stdout.take().unwrap();
+        let thread = thread::spawn(worker_factory(child_stdout));
+
+        let mut all_commands = vec![command.to_owned()];
+        args.iter()
+            .for_each(|arg| all_commands.push(arg.to_string()));
+
+        Ok(RgThread {
+            command: all_commands,
+            pid,
+            process,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn kill_and_wait(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.process.try_wait().is_err() {
+            self.process.kill()?;
+        }
+
+        self.thread
+            .take()
+            .map(|thread| {
+                thread.join().map_err(|err| {
+                    format!("{} error: {:?}", self.command.first().unwrap(), err).into()
+                })
+            })
+            .unwrap_or(Ok(()))
+    }
+
+    pub fn finished(&mut self) -> bool {
+        self.thread
+            .as_ref()
+            .map(|thread| thread.is_finished())
+            .unwrap_or(true)
+            && self
+                .process
+                .try_wait()
+                .map_or_else(|_| true, |opt| opt.is_some())
+    }
+}
+
 pub struct App {
     pub base_dir: String,
     pub inputs: Inputs,
@@ -36,9 +102,8 @@ pub struct App {
 
     pub results_scroll_offset: usize,
 
-    rg_process: Option<Child>,
     pub found_matches: Arc<Mutex<Vec<FoundMatch>>>,
-    comm_thread: Option<JoinHandle<()>>,
+    workers: Vec<RgThread>,
 }
 
 impl App {
@@ -49,8 +114,7 @@ impl App {
             events: Default::default(),
             inputs: Default::default(),
             results_scroll_offset: 0,
-            rg_process: None,
-            comm_thread: None,
+            workers: vec![],
             found_matches: Arc::new(Mutex::new(vec![])),
         };
         ret.inputs.focus_input(0);
@@ -60,19 +124,10 @@ impl App {
     }
 
     pub fn check_search_done(&mut self) {
-        if self
-            .comm_thread
-            .as_ref()
-            .map(|t| t.is_finished())
-            .unwrap_or(false)
-            || self
-                .rg_process
-                .as_mut()
-                .map(|p| p.try_wait().unwrap().is_some())
-                .unwrap_or(false)
-        {
-            self.kill_rg_process();
-            self.kill_worker_thread();
+        if self.workers.iter_mut().all(|worker| worker.finished()) {
+            if let Err(e) = self.kill_workers() {
+                self.log_error("Error killing workers")(e);
+            }
             self.set_idle();
         }
     }
@@ -90,57 +145,61 @@ impl App {
                 self.search_state = SearchState::Searching;
                 self.found_matches.lock().unwrap().clear();
 
-                let mut proc = Command::new("rg")
-                    .args([
+                let rg_worker = RgThread::new(
+                    "rg",
+                    &[
                         "--json",
                         "-C1",
                         &format!("\\b{}\\b", self.inputs.search_for_ident.get_value()),
                         &self.base_dir,
-                    ])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                let pid = proc.id();
+                    ],
+                    |child_stdout| self.make_rg_thread(child_stdout),
+                );
 
-                let child_stdout = proc.stdout.take().unwrap();
-                self.comm_thread = Some(self.spawn_rg_thread(child_stdout));
+                if let Err(err) = rg_worker {
+                    self.log_error("Error starting `rg`")(err);
+                    return;
+                }
 
-                self.rg_process = Some(proc);
+                let worker = rg_worker.unwrap();
+
+                let pid = worker.pid;
+                self.workers.push(worker);
+
                 self.events
                     .lock()
                     .unwrap()
-                    .push(format!("Started `rg` process {}", pid));
+                    .push(format!("start `rg`: {}", pid));
             }
+
             SearchState::Searching => {
-                self.kill_rg_process();
-                self.kill_worker_thread();
+                if let Err(e) = self.kill_workers() {
+                    self.log_error("error stopping search")(e);
+                }
+
                 self.set_idle();
             }
         }
     }
 
-    fn kill_rg_process(&mut self) {
-        if let Some(mut proc) = self.rg_process.take() {
-            let pid = proc.id();
+    fn log_error(&self, message: &str) -> impl FnMut(Box<dyn Error>) -> Box<dyn Error> {
+        let events = self.events.clone();
+        let msg = message.to_owned();
 
-            let msg = match proc.kill() {
-                Ok(()) => format!("Killed `rg` process {}", pid),
-                Err(err) => format!("Failed to kill `rg` process {}: {}", pid, err),
-            };
-
-            self.events.lock().unwrap().push(msg);
+        move |err| {
+            events.lock().unwrap().push(format!("{}: {}", msg, err));
+            err
         }
     }
 
-    fn kill_worker_thread(&mut self) {
-        if let Some(thread) = self.comm_thread.take() {
-            let msg = match thread.join() {
-                Ok(_) => "Killed worker thread".to_owned(),
-                Err(err) => format!("Failed to kill worker thread: {:?}", err),
-            };
-            self.events.lock().unwrap().push(msg)
+    fn kill_workers(&mut self) -> Result<(), Box<dyn Error>> {
+        let workers = std::mem::take(&mut self.workers);
+        for mut worker in workers {
+            worker
+                .kill_and_wait()
+                .map_err(self.log_error("Error killing worker"))?;
         }
+        Ok(())
     }
 
     fn set_idle(&mut self) {
@@ -148,11 +207,11 @@ impl App {
         self.search_state = SearchState::Idle;
     }
 
-    fn spawn_rg_thread(&mut self, mut child_stdout: ChildStdout) -> JoinHandle<()> {
+    fn make_rg_thread(&self, mut child_stdout: ChildStdout) -> impl FnOnce() {
         let shared_events = self.events.clone();
         let shared_found = self.found_matches.clone();
 
-        thread::spawn(move || {
+        move || {
             let mut buf = vec![0u8; 4096];
             let mut str_buf = String::new();
             let mut finished = false;
@@ -174,10 +233,13 @@ impl App {
                 }
 
                 let as_str = std::str::from_utf8(&buf[0..num_read]).unwrap();
-                shared_events
-                    .lock()
-                    .unwrap()
-                    .push(format!("from rg: `{}`", as_str));
+
+                if !as_str.is_empty() {
+                    shared_events
+                        .lock()
+                        .unwrap()
+                        .push(format!("from rg: `{}`", as_str));
+                }
 
                 str_buf.push_str(as_str);
 
@@ -213,7 +275,7 @@ impl App {
                     break;
                 }
             }
-        })
+        }
     }
 
     fn handle_command(
