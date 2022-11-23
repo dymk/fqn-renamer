@@ -1,3 +1,3 @@
-package com.example.foo;
+package com.example;
 
 class Foo {}

@@ -1,4 +1,4 @@
-use std::{borrow::BorrowMut, error::Error};
+use std::{borrow::BorrowMut, error::Error, mem};
 
 use tui::{interactive_form::InteractiveForm, widgets::TextInputState};
 
@@ -6,7 +6,7 @@ use crate::{event_log::EventLog, found_match::FoundMatch, fqcn::Fqcn, rg_worker_
 
 #[tui::macros::interactive_form]
 pub struct Inputs {
-    #[default("event")]
+    #[default("com.example.Foo")]
     pub search_for_ident: TextInputState,
     #[default("Search")]
     pub search_button: TextInputState,
@@ -15,10 +15,9 @@ pub struct Inputs {
     pub replace_button: TextInputState,
 }
 
-#[derive(Eq, PartialEq, Debug)]
 pub enum SearchState {
     Idle,
-    SearchingFqcn,
+    SearchingFqcn(Fqcn),
     SearchingIdent,
 }
 
@@ -26,7 +25,7 @@ pub struct App {
     pub base_dir: String,
     pub inputs: Inputs,
     pub events: EventLog,
-    pub search_state: SearchState,
+    search_state: SearchState,
 
     pub results_scroll_offset: usize,
     pub found_matches: Vec<FoundMatch>,
@@ -52,12 +51,42 @@ impl App {
     }
 
     pub fn check_search_done(&mut self) {
-        if self.search_state == SearchState::SearchingIdent {
+        if matches!(self.search_state, SearchState::SearchingIdent) {
             for worker in self.workers.iter() {
                 let mut results = worker.results();
+                self.events.info(format!(
+                    "app: got {} matches from ident worker",
+                    results.len()
+                ));
+                self.found_matches.append(results.borrow_mut());
+            }
+        } else if let SearchState::SearchingFqcn(fqcn) = &self.search_state {
+            for worker in self.workers.iter() {
+                let results = mem::take(&mut *worker.results());
                 self.events
                     .info(format!("app: got {} matches from worker", results.len()));
-                self.found_matches.append(results.borrow_mut());
+
+                for found_match in results {
+                    if found_match
+                        .matching_lines()
+                        .any(|line| line.starts_with("package "))
+                    {
+                        // same package -> positive match
+                        self.found_matches.push(found_match);
+                    } else if found_match
+                        .matching_lines()
+                        .any(|line| line.starts_with("import "))
+                    {
+                        // imports fqcn -> positive match
+                        self.found_matches.push(found_match);
+                    } else if found_match
+                        .matching_lines()
+                        .any(|line| line.contains(fqcn.value()))
+                    {
+                        // full fqcn referenced -> positive match
+                        self.found_matches.push(found_match);
+                    }
+                }
             }
         }
 
@@ -70,7 +99,7 @@ impl App {
     }
 
     pub fn search_input_submitted(&mut self) {
-        if self.search_state == SearchState::Idle {
+        if matches!(self.search_state, SearchState::Idle) {
             self.search_button_submitted();
         }
     }
@@ -80,15 +109,16 @@ impl App {
             SearchState::Idle => {
                 // try parsing fqcn
                 if let Some(fqcn) = Fqcn::new(self.inputs.search_for_ident.get_value()) {
-                    self.set_searching_and_clear_results(SearchState::SearchingFqcn);
+                    self.set_searching_and_clear_results();
                     self.search_for_fqcn(fqcn);
                 } else {
-                    self.set_searching_and_clear_results(SearchState::SearchingIdent);
+                    self.set_searching_and_clear_results();
+                    self.search_state = SearchState::SearchingIdent;
                     self.search_for_raw_ident(self.inputs.search_for_ident.get_value().to_owned());
                 }
             }
 
-            SearchState::SearchingFqcn | SearchState::SearchingIdent => {
+            SearchState::SearchingFqcn(_) | SearchState::SearchingIdent => {
                 if let Err(e) = self.kill_workers() {
                     self.log_error("error stopping search")(e);
                 }
@@ -105,8 +135,15 @@ impl App {
             self.events.clone(),
             &[
                 "--json",
-                "-C1",
-                &format!("\\b{}\\b", fqcn.value()),
+                // find the thing that defines the package, references the
+                // identifier (filter out the false positives later),
+                // or imports the identifier (use that for filtering)
+                &format!(
+                    r"(^package {};?$)|(\b{}\b)|(^import {};?$)",
+                    fqcn.package(),
+                    fqcn.ident(),
+                    fqcn.value()
+                ),
                 &self.base_dir,
             ],
         );
@@ -116,6 +153,7 @@ impl App {
             return;
         }
 
+        self.search_state = SearchState::SearchingFqcn(fqcn);
         let worker = fqcn_worker.unwrap();
         let pid = worker.pid();
         self.workers.push(worker);
@@ -134,8 +172,8 @@ impl App {
             return;
         }
 
+        self.search_state = SearchState::SearchingIdent;
         let worker = rg_worker.unwrap();
-
         let pid = worker.pid();
         self.workers.push(worker);
         self.events.info(format!("start `rg` ident: {}", pid));
@@ -171,9 +209,8 @@ impl App {
         self.search_state = SearchState::Idle;
     }
 
-    fn set_searching_and_clear_results(&mut self, state: SearchState) {
+    fn set_searching_and_clear_results(&mut self) {
         self.inputs.search_button.set_value("Searching...");
-        self.search_state = state;
         self.found_matches.clear();
     }
 }

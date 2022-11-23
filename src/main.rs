@@ -318,10 +318,10 @@ fn add_match_to_text<'a>(
 
     let mut prev_line = None;
 
-    for (line_num, (start, end), line) in found_match.context.iter() {
+    for (line_num, range, line) in found_match.context.iter() {
         let line_num = *line_num;
-        let start = *start as usize;
-        let end = *end as usize;
+        let start = range.start as usize;
+        let end = range.end as usize;
 
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {

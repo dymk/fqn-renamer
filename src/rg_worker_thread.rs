@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
 use std::{
     error::Error,
@@ -166,19 +167,19 @@ impl RgWorker {
         }
 
         if command["type"] == "context" {
-            Self::push_context(in_progress, &command, (0, 0));
+            Self::push_context(in_progress, &command, 0..0);
         }
 
         if command["type"] == "match" {
             let subs = &command["data"]["submatches"][0];
             let start = subs["start"].as_u64().unwrap();
             let end = subs["end"].as_u64().unwrap();
-            Self::push_context(in_progress, &command, (start, end));
+            Self::push_context(in_progress, &command, start..end);
             in_progress.line_number = command["data"]["line_number"].as_u64().unwrap();
         }
     }
 
-    fn push_context(found_match: &mut FoundMatch, command: &Value, highlight: (u64, u64)) {
+    fn push_context(found_match: &mut FoundMatch, command: &Value, highlight: Range<u64>) {
         found_match.context.push((
             command["data"]["line_number"].as_u64().unwrap(),
             highlight,
