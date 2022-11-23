@@ -1,25 +1,28 @@
 mod app;
+mod event_log;
 
-use app::App;
+use app::{App, FoundMatch};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{env, error::Error, io};
+use std::{env, error::Error, io, time::Duration};
 use tui::{
     backend::{Backend, CrosstermBackend},
     interactive_form::InteractiveForm,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Span,
+    text::{Span, Spans, Text},
     widgets::{Block, Borders, List, ListItem, TextInput},
     Frame, Terminal,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
     // main argument parsing
-    let base_dir = env::args().nth(0).expect("arg0: base dir to search");
+    let base_dir = env::args().next().expect("arg0: base dir to search");
 
     // setup terminal
     enable_raw_mode()?;
@@ -51,9 +54,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
+        app.check_search_done();
+
+        let has_event = event::poll(Duration::from_millis(100))?;
+        if !has_event {
+            continue;
+        }
 
         let event = event::read()?;
-        app.events.push(event);
+
+        if !matches!(event, Event::Mouse(_)) {
+            app.events
+                .lock()
+                .unwrap()
+                .push(format!("term event: {:?}", event));
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+        }) = event
+        {
+            if app.inputs.search_button.is_focused() {
+                app.search_button_submitted();
+            }
+        }
 
         if app.inputs.handle_event(event).is_consumed() {
             continue;
@@ -115,14 +140,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             .focused_style(focused_style())
             .placeholder_text("Identifier or FQCN");
 
-        f.render_interactive(search_input, l[0], &mut app.inputs.search_for_ident);
+        f.render_interactive(search_input, l[0], &app.inputs.search_for_ident);
 
         let preview_button = TextInput::new()
             .disable_cursor(true)
             .alignment(tui::layout::Alignment::Center)
             .focused_style(focused_style())
             .block(default_block().borders(Borders::ALL));
-        f.render_interactive(preview_button, l[1], &mut app.inputs.preview_button)
+        f.render_interactive(preview_button, l[1], &app.inputs.search_button)
     }
 
     // "Replace" input and preview button
@@ -137,14 +162,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             .block(default_block().title("Replace").borders(Borders::ALL))
             .placeholder_text("Identifier or FQCN");
 
-        f.render_interactive(search_input, l[0], &mut app.inputs.replace_with_ident);
+        f.render_interactive(search_input, l[0], &app.inputs.replace_with_ident);
 
         let replace_button = TextInput::new()
             .focused_style(focused_style())
             .disable_cursor(true)
             .alignment(tui::layout::Alignment::Center)
             .block(default_block().borders(Borders::ALL));
-        f.render_interactive(replace_button, l[1], &mut app.inputs.replace_button)
+        f.render_interactive(replace_button, l[1], &app.inputs.replace_button)
     }
 
     // Results / Replacement Preview area
@@ -156,41 +181,68 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let search_results_l = l[0];
         let replace_review_l = l[1];
 
-        let search_results_b = Block::default().title("Search Results").borders(Borders::ALL);
-        f.render_widget(search_results_b, search_results_l);
+        let matches = app.found_matches.lock().unwrap();
+        let search_results = List::new(
+            matches
+                .iter()
+                .map(|found_match| ListItem::new(found_match_to_span(found_match)))
+                .collect::<Vec<_>>(),
+        )
+        .block(
+            Block::default()
+                .title("Search Results")
+                .borders(Borders::ALL),
+        );
+        f.render_widget(search_results, search_results_l);
 
-        let replace_preview_b = Block::default().title("Replace Preview").borders(Borders::ALL);
+        let replace_preview_b = Block::default()
+            .title("Replace Preview")
+            .borders(Borders::ALL);
         f.render_widget(replace_preview_b, replace_review_l);
     }
 
-    {}
+    {
+        let e = app.events.lock().unwrap();
+        let events = List::new(
+            e.iter()
+                .map(|event| ListItem::new(Span::raw(event)))
+                .collect::<Vec<_>>(),
+        )
+        .block(Block::default().title("Events").borders(Borders::ALL));
+        f.render_widget(events, layout[2]);
+    }
+}
 
-    // let table = Table::new(
-    //     app.input_states
-    //         .iter()
-    //         .enumerate()
-    //         .map(|(idx, input_state)| {
-    //             Row::new(vec![
-    //                 Cell::from(Span::raw(format!("Input {}", idx + 1))),
-    //                 Cell::from(Span::styled(
-    //                     input_state.get_value(),
-    //                     Style::default().add_modifier(Modifier::BOLD),
-    //                 )),
-    //             ])
-    //         })
-    //         .collect::<Vec<_>>(),
-    // )
-    // .widths(&[Constraint::Min(10), Constraint::Percentage(100)])
-    // .block(Block::default().title("Input Values").borders(Borders::ALL));
-    // f.render_widget(table, layout[2]);
+fn found_match_to_span(found_match: &FoundMatch) -> Text<'_> {
+    let mut text = Text::default();
 
-    let events = List::new(
-        app.events
-            .iter()
-            .rev()
-            .map(|event| ListItem::new(Span::raw(format!("{:?}", event))))
-            .collect::<Vec<_>>(),
-    )
-    .block(Block::default().title("Events").borders(Borders::ALL));
-    f.render_widget(events, layout[2]);
+    text.lines
+        .push(Spans::from(vec![Span::raw(&found_match.file_path)]));
+
+    let mut prev_line = None;
+
+    for (line_num, (start, end), line) in found_match.context.iter() {
+        let line_num = *line_num;
+        let start = *start as usize;
+        let end = *end as usize;
+
+        if let Some(prev) = prev_line {
+            if prev + 1 != line_num {
+                text.lines.push(Spans(vec![Span::raw("-----")]));
+            }
+        }
+        prev_line = Some(line_num);
+
+        text.lines.push(Spans::from(vec![
+            Span::styled(
+                format!("{:>4}: ", line_num),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::raw(&line[0..start]),
+            Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
+            Span::raw(&line[end..]),
+        ]));
+    }
+
+    text
 }

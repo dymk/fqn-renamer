@@ -8,3 +8,6 @@ edition = "2021"
 [dependencies]
 tui = { git = "https://github.com/dymk/tui-rs", branch = "dymk--interactive-form" }
 crossterm = "0.23"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
