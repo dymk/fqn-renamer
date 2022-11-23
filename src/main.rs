@@ -1,5 +1,6 @@
 mod app;
 mod event_log;
+mod scrollable;
 
 use app::{App, FoundMatch};
 use crossterm::{
@@ -9,7 +10,14 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{env, error::Error, io, time::Duration};
+
+use std::{
+    cell::{RefCell, RefMut},
+    env,
+    error::Error,
+    io,
+    time::Duration,
+};
 use tui::{
     backend::{Backend, CrosstermBackend},
     interactive_form::InteractiveForm,
@@ -78,6 +86,38 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             if app.inputs.search_button.is_focused() {
                 app.search_button_submitted();
             }
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+        }) = event
+        {
+            app.results_scroll_offset = app.results_scroll_offset.saturating_sub(1);
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+        }) = event
+        {
+            app.results_scroll_offset = app.results_scroll_offset.saturating_add(1);
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+        }) = event
+        {
+            app.results_scroll_offset = app.results_scroll_offset.saturating_sub(10);
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+        }) = event
+        {
+            app.results_scroll_offset = app.results_scroll_offset.saturating_add(10);
         }
 
         if app.inputs.handle_event(event).is_consumed() {
@@ -193,21 +233,40 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     {
         let l = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .constraints([Constraint::Percentage(90), Constraint::Percentage(10)].as_ref())
             .split(layout[1]);
         let search_results_l = l[0];
         let replace_review_l = l[1];
 
         let matches = app.found_matches.lock().unwrap();
-        let search_results = List::new(
-            matches
-                .iter()
-                .map(|found_match| ListItem::new(found_match_to_span(found_match)))
-                .collect::<Vec<_>>(),
-        )
-        .block(
+        let num_matches = matches.len();
+        let mut skip_lines = app.results_scroll_offset;
+        let text = RefCell::new(vec![]);
+
+        let mut first = true;
+        for found_match in matches.iter() {
+            if !first {
+                if skip_lines == 0 {
+                    text.borrow_mut().push(vec![]);
+                }
+                skip_lines = skip_lines.saturating_sub(1);
+            }
+            first = false;
+
+            {
+                let text = text.borrow_mut();
+                add_match_to_text(&mut skip_lines, text, found_match)
+            }
+        }
+
+        let text = text.take().into_iter().map(Spans::from).collect::<Vec<_>>();
+
+        let search_results = Paragraph::new(Text::from(text)).block(
             Block::default()
-                .title("Search Results")
+                .title(Spans::from(vec![
+                    Span::raw("Search Results "),
+                    Span::raw(format!("({})", num_matches)),
+                ]))
                 .borders(Borders::ALL),
         );
         f.render_widget(search_results, search_results_l);
@@ -236,11 +295,15 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     }
 }
 
-fn found_match_to_span(found_match: &FoundMatch) -> Text<'_> {
-    let mut text = Text::default();
-
-    text.lines
-        .push(Spans::from(vec![Span::raw(&found_match.file_path)]));
+fn add_match_to_text<'a>(
+    skip_lines: &mut usize,
+    mut text: RefMut<Vec<Vec<Span<'a>>>>,
+    found_match: &'a FoundMatch,
+) {
+    if *skip_lines == 0 {
+        text.push(vec![Span::raw(&found_match.file_path)]);
+    }
+    *skip_lines = skip_lines.saturating_sub(1);
 
     let mut prev_line = None;
 
@@ -251,22 +314,27 @@ fn found_match_to_span(found_match: &FoundMatch) -> Text<'_> {
 
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {
-                text.lines.push(Spans(vec![Span::raw("-----")]));
+                if *skip_lines == 0 {
+                    text.push(vec![Span::raw("...")]);
+                }
+                *skip_lines = skip_lines.saturating_sub(1);
             }
         }
         prev_line = Some(line_num);
 
-        text.lines.push(Spans::from(vec![
-            Span::styled(
-                format!("{:>4}: ", line_num),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw(&line[0..start]),
-            Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
-            Span::raw(&line[end..]),
-        ]));
+        if *skip_lines == 0 {
+            text.push({
+                vec![
+                    Span::styled(
+                        format!("{:>4}: ", line_num),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::raw(&line[0..start]),
+                    Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
+                    Span::raw(&line[end..]),
+                ]
+            });
+        }
+        *skip_lines = skip_lines.saturating_sub(1);
     }
-
-    text.lines.push(Spans(vec![]));
-    text
 }

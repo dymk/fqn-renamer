@@ -7,13 +7,12 @@ use std::{
 };
 
 use serde_json::Value;
-use tui::widgets::TextInputState;
+use tui::{interactive_form::InteractiveForm, widgets::TextInputState};
 
 use crate::event_log::EventLog;
 
 #[tui::macros::interactive_form]
 pub struct Inputs {
-    #[default("TagType")]
     pub search_for_ident: TextInputState,
     #[default("Search")]
     pub search_button: TextInputState,
@@ -34,6 +33,8 @@ pub struct App {
     pub events: Arc<Mutex<EventLog>>,
     pub search_state: SearchState,
 
+    pub results_scroll_offset: usize,
+
     rg_process: Option<Child>,
     pub found_matches: Arc<Mutex<Vec<FoundMatch>>>,
     comm_thread: Option<JoinHandle<()>>,
@@ -46,10 +47,12 @@ impl App {
             search_state: SearchState::Idle,
             events: Default::default(),
             inputs: Default::default(),
+            results_scroll_offset: 0,
             rg_process: None,
             comm_thread: None,
             found_matches: Arc::new(Mutex::new(vec![])),
         };
+        ret.inputs.focus_input(0);
         ret.inputs.search_button.read_only(true);
         ret.inputs.replace_button.read_only(true);
         ret
@@ -81,7 +84,7 @@ impl App {
                 self.found_matches.lock().unwrap().clear();
 
                 let mut proc = Command::new("rg")
-                    .args(&[
+                    .args([
                         "--json",
                         "-C1",
                         self.inputs.search_for_ident.get_value(),
@@ -113,28 +116,23 @@ impl App {
     fn kill_rg_process(&mut self) {
         if let Some(mut proc) = self.rg_process.take() {
             let pid = proc.id();
-            proc.kill().unwrap();
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("Killed `rg` process {}", pid));
+
+            let msg = match proc.kill() {
+                Ok(()) => format!("Killed `rg` process {}", pid),
+                Err(err) => format!("Failed to kill `rg` process {}: {}", pid, err),
+            };
+
+            self.events.lock().unwrap().push(msg);
         }
     }
 
     fn kill_worker_thread(&mut self) {
         if let Some(thread) = self.comm_thread.take() {
-            match thread.join() {
-                Ok(_) => self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .push("Killed worker thread".to_string()),
-                Err(_) => self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .push("Error killing worker thread".to_string()),
-            }
+            let msg = match thread.join() {
+                Ok(_) => "Killed worker thread".to_owned(),
+                Err(err) => format!("Failed to kill worker thread: {:?}", err),
+            };
+            self.events.lock().unwrap().push(msg)
         }
     }
 
@@ -190,7 +188,12 @@ impl App {
                     let (command, rest) = str_buf.split_at(cmd_end);
                     if !command.is_empty() {
                         let command: Value = serde_json::from_str(command).unwrap();
-                        App::handle_command(&mut in_progress_found, &shared_found, command);
+                        App::handle_command(
+                            &mut in_progress_found,
+                            &shared_events,
+                            &shared_found,
+                            command,
+                        );
                     }
 
                     str_buf = rest.to_owned();
@@ -208,6 +211,7 @@ impl App {
 
     fn handle_command(
         in_progress_found: &mut FoundMatch,
+        shared_events: &Arc<Mutex<EventLog>>,
         shared_found: &Arc<Mutex<Vec<FoundMatch>>>,
         command: Value,
     ) {
@@ -219,6 +223,12 @@ impl App {
         if command["type"] == "end" {
             let mut found = FoundMatch::default();
             mem::swap(in_progress_found, &mut found);
+
+            shared_events
+                .lock()
+                .unwrap()
+                .push(format!("push found: `{:?}`", found));
+
             shared_found.lock().unwrap().push(found);
         }
 

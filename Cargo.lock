@@ -291,7 +291,6 @@ dependencies = [
 [[package]]
 name = "tui"
 version = "0.18.0"
-source = "git+https://github.com/dymk/tui-rs?branch=dymk--interactive-form#679709be016070bfda0b215e8712257d17262e96"
 dependencies = [
  "bitflags",
  "cassowary",
@@ -304,7 +303,6 @@ dependencies = [
 [[package]]
 name = "tui-rs-macros"
 version = "0.0.1"
-source = "git+https://github.com/dymk/tui-rs?branch=dymk--interactive-form#679709be016070bfda0b215e8712257d17262e96"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
