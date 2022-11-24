@@ -12,14 +12,14 @@ use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 
 use crate::event_log::EventLog;
-use crate::found_match::FoundMatch;
+use crate::matched_file::{Line, Match, MatchType, MatchedFile};
 
 pub struct RgWorker {
     name: String,
     pid: u32,
     process: Child,
     thread: Option<JoinHandle<()>>,
-    results: Arc<Mutex<Vec<FoundMatch>>>,
+    results: Arc<Mutex<Vec<MatchedFile>>>,
 }
 
 impl RgWorker {
@@ -34,7 +34,7 @@ impl RgWorker {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let results: Arc<Mutex<Vec<FoundMatch>>> = Default::default();
+        let results: Arc<Mutex<Vec<MatchedFile>>> = Default::default();
         let pid = process.id();
         let child_stdout = process.stdout.take().unwrap();
         let thread = thread::spawn(Self::worker_impl_factory(
@@ -83,21 +83,21 @@ impl RgWorker {
                 .map_or_else(|_| true, |opt| opt.is_some())
     }
 
-    pub fn results(&self) -> MutexGuard<Vec<FoundMatch>> {
+    pub fn results(&self) -> MutexGuard<Vec<MatchedFile>> {
         self.results.lock()
     }
 
     fn worker_impl_factory(
         name: String,
         mut events: EventLog,
-        matches: Arc<Mutex<Vec<FoundMatch>>>,
+        matches: Arc<Mutex<Vec<MatchedFile>>>,
         mut child_stdout: ChildStdout,
     ) -> impl FnOnce() {
         move || {
             let mut buf = vec![0u8; 4096];
             let mut str_buf = String::new();
             let mut finished = false;
-            let mut in_progress_found = FoundMatch::default();
+            let mut in_progress_found = MatchedFile::default();
 
             events.info(format!("rg {}: waiting for stdout", name));
 
@@ -150,9 +150,9 @@ impl RgWorker {
 
     fn handle_command(
         name: &str,
-        in_progress: &mut FoundMatch,
+        in_progress: &mut MatchedFile,
         events: &mut EventLog,
-        matches: &Arc<Mutex<Vec<FoundMatch>>>,
+        matches: &Arc<Mutex<Vec<MatchedFile>>>,
         command: Value,
     ) {
         if command["type"] == "begin" {
@@ -160,33 +160,46 @@ impl RgWorker {
         }
 
         if command["type"] == "end" {
-            let mut found = FoundMatch::default();
+            let mut found = MatchedFile::default();
             mem::swap(in_progress, &mut found);
             events.info(format!("rg {}: match in `{:?}`", name, found.file_path));
             matches.lock().push(found);
         }
 
         if command["type"] == "context" {
-            Self::push_context(in_progress, &command, 0..0);
+            Self::push_context(in_progress, &command, None);
         }
 
         if command["type"] == "match" {
             let subs = &command["data"]["submatches"][0];
-            let start = subs["start"].as_u64().unwrap();
-            let end = subs["end"].as_u64().unwrap();
-            Self::push_context(in_progress, &command, start..end);
-            in_progress.line_number = command["data"]["line_number"].as_u64().unwrap();
+            let start = subs["start"].as_u64().unwrap() as usize;
+            let end = subs["end"].as_u64().unwrap() as usize;
+            Self::push_context(in_progress, &command, Some(start..end));
         }
     }
 
-    fn push_context(found_match: &mut FoundMatch, command: &Value, highlight: Range<u64>) {
-        found_match.context.push((
-            command["data"]["line_number"].as_u64().unwrap(),
-            highlight,
-            command["data"]["lines"]["text"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        ));
+    fn push_context(
+        found_match: &mut MatchedFile,
+        command: &Value,
+        match_range: Option<Range<usize>>,
+    ) {
+        let line_num = command["data"]["line_number"].as_u64().unwrap() as usize;
+        let value = command["data"]["lines"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let line = if let Some(match_range) = match_range {
+            Line::Match(Match {
+                match_type: MatchType::Arbitrary,
+                line_num,
+                match_range,
+                value,
+            })
+        } else {
+            Line::Context { line_num, value }
+        };
+
+        found_match.lines.push(line)
     }
 }

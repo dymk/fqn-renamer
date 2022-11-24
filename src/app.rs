@@ -2,7 +2,10 @@ use std::{borrow::BorrowMut, error::Error, mem};
 
 use tui::{interactive_form::InteractiveForm, widgets::TextInputState};
 
-use crate::{event_log::EventLog, found_match::FoundMatch, fqcn::Fqcn, rg_worker_thread::RgWorker};
+use crate::{
+    event_log::EventLog, fqcn::Fqcn, fqcn_replacer::process_matched_file_fqcn,
+    matched_file::MatchedFile, rg_worker_thread::RgWorker,
+};
 
 #[tui::macros::interactive_form]
 pub struct Inputs {
@@ -28,7 +31,9 @@ pub struct App {
     search_state: SearchState,
 
     pub results_scroll_offset: usize,
-    pub found_matches: Vec<FoundMatch>,
+
+    pub found_matches: Vec<MatchedFile>,
+    pub replacments: Vec<MatchedFile>,
 
     workers: Vec<RgWorker>,
 }
@@ -42,6 +47,7 @@ impl App {
             inputs: Default::default(),
             results_scroll_offset: 0,
             found_matches: vec![],
+            replacments: vec![],
             workers: vec![],
         };
         ret.inputs.focus_input(0);
@@ -51,6 +57,8 @@ impl App {
     }
 
     pub fn check_search_done(&mut self) {
+        let mut results_changed = false;
+
         if matches!(self.search_state, SearchState::SearchingIdent) {
             for worker in self.workers.iter() {
                 let mut results = worker.results();
@@ -59,34 +67,18 @@ impl App {
                     results.len()
                 ));
                 self.found_matches.append(results.borrow_mut());
+                results_changed = true;
             }
         } else if let SearchState::SearchingFqcn(fqcn) = &self.search_state {
             for worker in self.workers.iter() {
                 let results = mem::take(&mut *worker.results());
                 self.events
                     .info(format!("app: got {} matches from worker", results.len()));
-
-                for found_match in results {
-                    if found_match
-                        .matching_lines()
-                        .any(|line| line.starts_with("package "))
-                    {
-                        // same package -> positive match
-                        self.found_matches.push(found_match);
-                    } else if found_match
-                        .matching_lines()
-                        .any(|line| line.starts_with("import "))
-                    {
-                        // imports fqcn -> positive match
-                        self.found_matches.push(found_match);
-                    } else if found_match
-                        .matching_lines()
-                        .any(|line| line.contains(fqcn.value()))
-                    {
-                        // full fqcn referenced -> positive match
-                        self.found_matches.push(found_match);
-                    }
+                let mut results = process_matched_file_fqcn(fqcn, results);
+                if !results.is_empty() {
+                    results_changed = true;
                 }
+                self.found_matches.append(&mut results);
             }
         }
 
@@ -96,11 +88,63 @@ impl App {
             }
             self.set_idle();
         }
+
+        if results_changed {
+            self.update_replacements();
+        }
     }
 
     pub fn search_input_submitted(&mut self) {
         if matches!(self.search_state, SearchState::Idle) {
             self.search_button_submitted();
+        }
+    }
+
+    pub fn replace_input_submitted(&mut self) {
+        if !matches!(self.search_state, SearchState::Idle) {
+            self.events
+                .error("app: cannot do replace while searching".to_owned());
+        }
+    }
+
+    pub fn update_replacements(&mut self) {
+        self.replacments.clear();
+
+        let find_ident = self.inputs.search_for_ident.get_value();
+        let repl_ident = self.inputs.replace_with_ident.get_value();
+
+        if let Some(find_fqcn) = Fqcn::new(find_ident) {
+            if let Some(repl_fqcn) = Fqcn::new(repl_ident) {
+                self.update_replacements_fqcn(find_fqcn, repl_fqcn);
+                return;
+            }
+        }
+
+        // not a valid fqcn, just do a straight identifier replacement
+        let ident = if repl_ident.is_empty() {
+            find_ident
+        } else {
+            repl_ident
+        };
+        for mf in self.found_matches.iter() {
+            self.replacments.push(mf.replace(&|_| ident.to_owned()));
+        }
+    }
+
+    fn update_replacements_fqcn(&mut self, find: Fqcn, repl: Fqcn) {
+        for mf in self.found_matches.iter() {
+            self.replacments.push(mf.replace(&|ident| {
+                if ident == find.ident() {
+                    repl.ident()
+                } else if ident == find.value() {
+                    repl.value()
+                } else if ident == find.package() {
+                    repl.package()
+                } else {
+                    repl.ident()
+                }
+                .to_owned()
+            }));
         }
     }
 
@@ -135,13 +179,19 @@ impl App {
             self.events.clone(),
             &[
                 "--json",
+                "-C1",
                 // find the thing that defines the package, references the
                 // identifier (filter out the false positives later),
                 // or imports the identifier (use that for filtering)
                 &format!(
-                    r"(^package {};?$)|(\b{}\b)|(^import {};?$)",
+                    r"(^package {};?$)|(\b{}\b)|(\b{}\b)|(^import {};?$)",
+                    // `package foo.Bar`
                     fqcn.package(),
+                    // `Bar`
                     fqcn.ident(),
+                    // `foo.Bar`
+                    fqcn.value(),
+                    // `import foo.Bar`
                     fqcn.value()
                 ),
                 &self.base_dir,
@@ -210,7 +260,12 @@ impl App {
     }
 
     fn set_searching_and_clear_results(&mut self) {
-        self.inputs.search_button.set_value("Searching...");
+        self.events.info(format!(
+            "app: starting search for `{}`",
+            self.inputs.search_for_ident.get_value()
+        ));
+        self.inputs.search_button.set_value("Stop Search");
         self.found_matches.clear();
+        self.results_scroll_offset = 0;
     }
 }

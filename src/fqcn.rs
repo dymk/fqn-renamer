@@ -13,7 +13,7 @@ impl Fqcn {
     pub fn new<S: Into<String>>(value: S) -> Option<Self> {
         let value = value.into();
 
-        let re = Regex::new(r"^(([a-z0-9][a-z0-9\.]+\.)+)?([A-Z][\w]*)?$").unwrap();
+        let re = Regex::new(r"^(([a-z0-9][a-z0-9\.]+)+\.)?([A-Z][\w]*)?$").unwrap();
         let captures = re.captures(value.as_ref())?;
         let package_range = captures.get(2).map(|m| m.range())?;
         let ident_range = captures.get(3).map(|m| m.range())?;
@@ -33,6 +33,10 @@ impl Fqcn {
         &self.value[self.package_range.clone()]
     }
 
+    pub fn package_with_trailing(&self) -> &str {
+        &self.value[self.package_range.start..(self.package_range.end + 1)]
+    }
+
     pub fn ident(&self) -> &str {
         &self.value[self.ident_range.clone()]
     }
@@ -48,7 +52,7 @@ mod test {
     fn test_works() {
         let fqcn = Fqcn::new("foo.bar.Baz").unwrap();
         assert_eq!("Baz", fqcn.ident());
-        assert_eq!("foo.bar.", fqcn.package());
+        assert_eq!("foo.bar", fqcn.package());
         assert_eq!("foo.bar.Baz", fqcn.value());
 
         assert!(Fqcn::new("foo.bar").is_none());

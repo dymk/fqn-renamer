@@ -1,7 +1,8 @@
 mod app;
 mod event_log;
-mod found_match;
 mod fqcn;
+mod fqcn_replacer;
+mod matched_file;
 mod rg_worker_thread;
 mod scrollable;
 
@@ -13,8 +14,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use found_match::FoundMatch;
 use fqcn::Fqcn;
+use matched_file::{Line, MatchedFile};
 use scrollable::Scrollable;
 
 use std::{cell::RefCell, env, error::Error, io, time::Duration};
@@ -24,7 +25,7 @@ use tui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, TextInput},
+    widgets::{Block, Borders, InteractiveWidgetState, List, ListItem, Paragraph, TextInput},
     Frame, Terminal,
 };
 
@@ -88,6 +89,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             // 'enter' key pressed while on search input => start search
             else if app.inputs.search_for_ident.is_focused() {
                 app.search_input_submitted();
+            } else if app.inputs.replace_button.is_focused() {
+                app.replace_input_submitted();
             }
         }
 
@@ -123,7 +126,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             app.results_scroll_offset = app.results_scroll_offset.saturating_add(10);
         }
 
-        if app.inputs.handle_event(event).is_consumed() {
+        let consumed = app.inputs.handle_event(event).is_consumed();
+
+        if app.inputs.replace_with_ident.changed() {
+            app.update_replacements();
+        }
+
+        if consumed {
             continue;
         }
 
@@ -238,14 +247,16 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     {
         let l = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(90), Constraint::Percentage(10)].as_ref())
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
             .split(layout[1]);
         let search_results_l = l[0];
         let replace_review_l = l[1];
 
         let matches = &app.found_matches;
         let num_files = matches.len();
-        let mut scrollable = RefCell::new(Scrollable::new(
+        let num_matches: usize = matches.iter().map(|fm| fm.matches().count()).sum();
+
+        let mut search_scrollable = RefCell::new(Scrollable::new(
             app.results_scroll_offset,
             search_results_l.height as usize,
         ));
@@ -253,25 +264,43 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let mut first = true;
         for found_match in matches.iter() {
             if !first {
-                scrollable.borrow_mut().push(|| Spans::from(vec![]));
+                search_scrollable.borrow_mut().push(|| Spans::from(vec![]));
             }
             first = false;
-            add_match_to_text(&mut scrollable, found_match, 20);
+            add_match_to_scrollable(&mut search_scrollable, found_match, true);
         }
 
-        let search_results = Paragraph::new(Text::from(scrollable.take().get())).block(
+        let search_results = Paragraph::new(Text::from(search_scrollable.take().get())).block(
             Block::default()
                 .title(Spans::from(vec![
                     Span::raw("Search Results "),
-                    Span::raw(format!("({} files, {} matches)", num_files, num_files)),
+                    Span::raw(format!("({} files, {} matches)", num_files, num_matches)),
                 ]))
                 .borders(Borders::ALL),
         );
         f.render_widget(search_results, search_results_l);
 
-        let replace_preview_b = Block::default()
-            .title("Replace Preview")
-            .borders(Borders::ALL);
+        let replacements = &app.replacments;
+        let mut preview_scrollable = RefCell::new(Scrollable::new(
+            app.results_scroll_offset,
+            search_results_l.height as usize,
+        ));
+
+        let mut first = true;
+        for found_match in replacements.iter() {
+            if !first {
+                preview_scrollable.borrow_mut().push(|| Spans::from(vec![]));
+            }
+            first = false;
+            add_match_to_scrollable(&mut preview_scrollable, found_match, false);
+        }
+
+        let replace_preview_b = Paragraph::new(Text::from(preview_scrollable.take().get())).block(
+            Block::default()
+                .title(Span::raw("Replace Preview"))
+                .borders(Borders::ALL),
+        );
+
         f.render_widget(replace_preview_b, replace_review_l);
     }
 
@@ -302,45 +331,65 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     }
 }
 
-fn add_match_to_text<'a>(
-    text: &mut RefCell<Scrollable<Spans<'a>>>,
-    found_match: &'a FoundMatch,
-    results_area_width: usize,
+fn add_match_to_scrollable<'a>(
+    scrollable: &mut RefCell<Scrollable<Spans<'a>>>,
+    found_match: &'a MatchedFile,
+    is_preview: bool,
 ) {
-    let section_sep = format!("    |{}", "-".repeat(results_area_width - 5));
+    let section_sep = format!("    |{}", "-".repeat(10));
+    let match_color = if is_preview {
+        Color::Yellow
+    } else {
+        Color::Rgb(181, 96, 43)
+    };
 
-    text.borrow_mut().push(|| {
-        Spans::from(vec![Span::styled(
+    scrollable.borrow_mut().push(|| {
+        let mut v = vec![Span::styled(
             &found_match.file_path,
             Style::default().fg(tui::style::Color::Magenta),
-        )])
+        )];
+
+        if is_preview {
+            v.push(Span::raw(" "));
+            v.push(Span::styled(
+                format!("({})", found_match.matches().count()),
+                Style::default().fg(Color::Blue),
+            ));
+        }
+
+        v.into()
     });
 
     let mut prev_line = None;
 
-    for (line_num, range, line) in found_match.context.iter() {
-        let line_num = *line_num;
-        let start = range.start as usize;
-        let end = range.end as usize;
+    for line in found_match.lines.iter() {
+        let line_num = line.line_num();
 
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {
-                text.borrow_mut()
+                scrollable
+                    .borrow_mut()
                     .push(|| Spans::from(vec![Span::raw(section_sep.clone())]));
             }
         }
         prev_line = Some(line_num);
 
-        text.borrow_mut().push(|| {
-            Spans::from(vec![
-                Span::styled(
-                    format!("{:>4}| ", line_num),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::raw(&line[0..start]),
-                Span::styled(&line[start..end], Style::default().fg(Color::Yellow)),
-                Span::raw(&line[end..]),
-            ])
+        scrollable.borrow_mut().push(|| {
+            let line_num_prefix = Span::styled(
+                format!("{:>4}| ", line_num),
+                Style::default().fg(Color::DarkGray),
+            );
+
+            match line {
+                Line::Context { value, .. } => vec![line_num_prefix, Span::raw(value)],
+                Line::Match(m) => vec![
+                    line_num_prefix,
+                    Span::raw(m.before()),
+                    Span::styled(m.middle(), Style::default().fg(match_color)),
+                    Span::raw(m.after()),
+                ],
+            }
+            .into()
         });
     }
 }
@@ -349,7 +398,10 @@ fn make_fqcn_styler() -> impl FnOnce(bool, &str) -> Spans {
     |_focused, contents| {
         if let Some(fqcn) = Fqcn::new(contents) {
             vec![
-                Span::styled(fqcn.package().to_owned(), Style::default().fg(Color::Green)),
+                Span::styled(
+                    fqcn.package_with_trailing().to_owned(),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::styled(fqcn.ident().to_owned(), Style::default().fg(Color::Blue)),
             ]
             .into()
