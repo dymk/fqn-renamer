@@ -1,10 +1,10 @@
-use std::{borrow::BorrowMut, error::Error, mem};
+use std::{borrow::BorrowMut, error::Error, fs::File, io::BufWriter, mem};
 
 use tui::{interactive_form::InteractiveForm, widgets::TextInputState};
 
 use crate::{
-    event_log::EventLog, fqcn::Fqcn, fqcn_replacer::process_matched_file_fqcn,
-    matched_file::MatchedFile, rg_worker_thread::RgWorker,
+    event_log::EventLog, fqcn::Fqcn, fqcn_processor::process_matched_file_fqcn,
+    matched_file::MatchedFile, rg_worker::RgWorker,
 };
 
 #[tui::macros::interactive_form]
@@ -13,6 +13,7 @@ pub struct Inputs {
     pub search_for_ident: TextInputState,
     #[default("Search")]
     pub search_button: TextInputState,
+    #[default("net.other.Quux")]
     pub replace_with_ident: TextInputState,
     #[default("Replace")]
     pub replace_button: TextInputState,
@@ -27,6 +28,7 @@ pub enum SearchState {
 pub struct App {
     pub base_dir: String,
     pub inputs: Inputs,
+    pub show_events: bool,
     pub events: EventLog,
     search_state: SearchState,
 
@@ -43,6 +45,7 @@ impl App {
         let mut ret = App {
             base_dir,
             search_state: SearchState::Idle,
+            show_events: false,
             events: Default::default(),
             inputs: Default::default(),
             results_scroll_offset: 0,
@@ -105,6 +108,63 @@ impl App {
             self.events
                 .error("app: cannot do replace while searching".to_owned());
         }
+
+        if let Err(e) = self.execute_replacements() {
+            self.events.error(format!("app: error replacing: {}", e));
+        }
+    }
+
+    fn execute_replacements(&mut self) -> Result<(), Box<dyn Error>> {
+        let replacements = mem::take(&mut self.replacments);
+        let mut num_replacements = 0;
+
+        for replacement in replacements.iter() {
+            num_replacements += self.execute_replacement(replacement)?;
+        }
+
+        self.replacments = replacements;
+        self.events.info(format!(
+            "app: replaced {} matches in {} files",
+            num_replacements,
+            self.replacments.len(),
+        ));
+
+        Ok(())
+    }
+
+    fn execute_replacement(&mut self, replacement: &MatchedFile) -> Result<usize, Box<dyn Error>> {
+        // copy the original file into a .bak version
+        let file_path = replacement.file_path();
+        let backup_file_path = format!("{}{}", file_path, ".bak");
+
+        if std::fs::metadata(&backup_file_path).is_ok() {
+            Err(format!("{} already exists, aborting", backup_file_path))?;
+        }
+
+        std::fs::copy(file_path, backup_file_path)?;
+
+        let mut contents = ropey::Rope::from_reader(File::open(file_path)?)?;
+
+        let mut num_replacements = 0;
+
+        for line in replacement.lines() {
+            num_replacements += line.num_submatches();
+
+            let start_idx = contents.line_to_char(line.num());
+            let end_idx = contents.line_to_char(line.num() + 1);
+
+            contents.remove(start_idx..end_idx);
+            contents.insert(start_idx, line.value());
+        }
+
+        self.events.info(format!(
+            "app: {} replacements in {}",
+            num_replacements, file_path
+        ));
+
+        contents.write_to(BufWriter::new(File::create(file_path)?))?;
+
+        Ok(num_replacements)
     }
 
     pub fn update_replacements(&mut self) {
@@ -117,6 +177,9 @@ impl App {
             if let Some(repl_fqcn) = Fqcn::new(repl_ident) {
                 self.update_replacements_fqcn(find_fqcn, repl_fqcn);
                 return;
+            } else {
+                self.update_replacements_fqcn(find_fqcn.clone(), find_fqcn);
+                return;
             }
         }
 
@@ -127,13 +190,13 @@ impl App {
             repl_ident
         };
         for mf in self.found_matches.iter() {
-            self.replacments.push(mf.replace(&|_| ident.to_owned()));
+            self.replacments.push(mf.replace(|_| ident));
         }
     }
 
     fn update_replacements_fqcn(&mut self, find: Fqcn, repl: Fqcn) {
         for mf in self.found_matches.iter() {
-            self.replacments.push(mf.replace(&|ident| {
+            self.replacments.push(mf.replace(|ident| {
                 if ident == find.ident() {
                     repl.ident()
                 } else if ident == find.value() {
@@ -141,9 +204,8 @@ impl App {
                 } else if ident == find.package() {
                     repl.package()
                 } else {
-                    repl.ident()
+                    unreachable!()
                 }
-                .to_owned()
             }));
         }
     }
@@ -178,8 +240,11 @@ impl App {
             "fqcn_worker",
             self.events.clone(),
             &[
+                // ignore all .bak files
+                "-g",
+                "!*.bak",
                 "--json",
-                "-C1",
+                "-C2",
                 // find the thing that defines the package, references the
                 // identifier (filter out the false positives later),
                 // or imports the identifier (use that for filtering)

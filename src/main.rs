@@ -1,9 +1,9 @@
 mod app;
 mod event_log;
 mod fqcn;
-mod fqcn_replacer;
+mod fqcn_processor;
 mod matched_file;
-mod rg_worker_thread;
+mod rg_worker;
 mod scrollable;
 
 use app::App;
@@ -15,7 +15,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fqcn::Fqcn;
-use matched_file::{Line, MatchedFile};
+use matched_file::MatchedFile;
 use scrollable::Scrollable;
 
 use std::{cell::RefCell, env, error::Error, io, time::Duration};
@@ -136,7 +136,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             continue;
         }
 
-        if let Event::Key(key) = event {
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Char('l'),
+            modifiers: KeyModifiers::CONTROL,
+        }) = event
+        {
+            app.show_events = !app.show_events;
+        } else if let Event::Key(key) = event {
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc => return Ok(()),
@@ -159,7 +165,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 // results
                 Constraint::Min(10),
                 // event log
-                Constraint::Length(15),
+                Constraint::Length(if app.show_events { 30 } else { 2 }),
             ]
             .as_ref(),
         )
@@ -254,7 +260,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
 
         let matches = &app.found_matches;
         let num_files = matches.len();
-        let num_matches: usize = matches.iter().map(|fm| fm.matches().count()).sum();
+        let num_matches: usize = matches.iter().map(|fm| fm.lines().count()).sum();
 
         let mut search_scrollable = RefCell::new(Scrollable::new(
             app.results_scroll_offset,
@@ -304,7 +310,10 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         f.render_widget(replace_preview_b, replace_review_l);
     }
 
-    {
+    let event_block = Block::default()
+        .title("Event Log (toggle: ctrl+l)")
+        .borders(Borders::ALL);
+    if app.show_events {
         let events_list = app.events.list();
         let events = List::new(
             events_list
@@ -326,8 +335,10 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 })
                 .collect::<Vec<_>>(),
         )
-        .block(Block::default().title("Events").borders(Borders::ALL));
+        .block(event_block);
         f.render_widget(events, layout[2]);
+    } else {
+        f.render_widget(event_block, layout[2]);
     }
 }
 
@@ -345,14 +356,14 @@ fn add_match_to_scrollable<'a>(
 
     scrollable.borrow_mut().push(|| {
         let mut v = vec![Span::styled(
-            &found_match.file_path,
+            found_match.file_path(),
             Style::default().fg(tui::style::Color::Magenta),
         )];
 
         if is_preview {
             v.push(Span::raw(" "));
             v.push(Span::styled(
-                format!("({})", found_match.matches().count()),
+                format!("({})", found_match.lines().count()),
                 Style::default().fg(Color::Blue),
             ));
         }
@@ -362,8 +373,8 @@ fn add_match_to_scrollable<'a>(
 
     let mut prev_line = None;
 
-    for line in found_match.lines.iter() {
-        let line_num = line.line_num();
+    for line in found_match.lines() {
+        let line_num = line.num();
 
         if let Some(prev) = prev_line {
             if prev + 1 != line_num {
@@ -375,21 +386,24 @@ fn add_match_to_scrollable<'a>(
         prev_line = Some(line_num);
 
         scrollable.borrow_mut().push(|| {
-            let line_num_prefix = Span::styled(
-                format!("{:>4}| ", line_num),
+            let line_num_prefix = std::iter::once(Span::styled(
+                // add one to make line numbers one-indexed
+                format!("{:>4}| ", line_num + 1),
                 Style::default().fg(Color::DarkGray),
-            );
+            ));
 
-            match line {
-                Line::Context { value, .. } => vec![line_num_prefix, Span::raw(value)],
-                Line::Match(m) => vec![
-                    line_num_prefix,
-                    Span::raw(m.before()),
-                    Span::styled(m.middle(), Style::default().fg(match_color)),
-                    Span::raw(m.after()),
-                ],
-            }
-            .into()
+            let highlighted = line.iter().map(|(is_match, substr)| {
+                if is_match {
+                    Span::styled(substr, Style::default().fg(match_color))
+                } else {
+                    Span::raw(substr)
+                }
+            });
+
+            line_num_prefix
+                .chain(highlighted)
+                .collect::<Vec<_>>()
+                .into()
         });
     }
 }

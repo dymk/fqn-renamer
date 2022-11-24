@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use regex::Regex;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Fqcn {
     value: String,
     package_range: Range<usize>,

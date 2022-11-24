@@ -12,7 +12,7 @@ use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 
 use crate::event_log::EventLog;
-use crate::matched_file::{Line, Match, MatchType, MatchedFile};
+use crate::matched_file::{Line, MatchedFile};
 
 pub struct RgWorker {
     name: String,
@@ -97,7 +97,7 @@ impl RgWorker {
             let mut buf = vec![0u8; 4096];
             let mut str_buf = String::new();
             let mut finished = false;
-            let mut in_progress_found = MatchedFile::default();
+            let mut in_progress_found = MatchedFileBuilder::default();
 
             events.info(format!("rg {}: waiting for stdout", name));
 
@@ -150,56 +150,65 @@ impl RgWorker {
 
     fn handle_command(
         name: &str,
-        in_progress: &mut MatchedFile,
+        builder: &mut MatchedFileBuilder,
         events: &mut EventLog,
         matches: &Arc<Mutex<Vec<MatchedFile>>>,
         command: Value,
     ) {
+        // events.info(format!("rg command: {}", command));
+
         if command["type"] == "begin" {
-            in_progress.file_path = command["data"]["path"]["text"].as_str().unwrap().to_owned();
+            builder.file_path = command["data"]["path"]["text"].as_str().unwrap().to_owned();
         }
 
         if command["type"] == "end" {
-            let mut found = MatchedFile::default();
-            mem::swap(in_progress, &mut found);
-            events.info(format!("rg {}: match in `{:?}`", name, found.file_path));
+            let found = builder.build();
+            events.info(format!("rg {}: match in `{:?}`", name, found.file_path()));
             matches.lock().push(found);
         }
 
         if command["type"] == "context" {
-            Self::push_context(in_progress, &command, None);
+            Self::push_context(builder, &command, vec![]);
         }
 
         if command["type"] == "match" {
-            let subs = &command["data"]["submatches"][0];
-            let start = subs["start"].as_u64().unwrap() as usize;
-            let end = subs["end"].as_u64().unwrap() as usize;
-            Self::push_context(in_progress, &command, Some(start..end));
+            let subs = command["data"]["submatches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|submatch| {
+                    let start = submatch["start"].as_u64().unwrap() as usize;
+                    let end = submatch["end"].as_u64().unwrap() as usize;
+                    start..end
+                })
+                .collect();
+            Self::push_context(builder, &command, subs);
         }
     }
 
     fn push_context(
-        found_match: &mut MatchedFile,
+        builder: &mut MatchedFileBuilder,
         command: &Value,
-        match_range: Option<Range<usize>>,
+        submatches: Vec<Range<usize>>,
     ) {
-        let line_num = command["data"]["line_number"].as_u64().unwrap() as usize;
+        // lines are 1-indexed from rg, sub 1 to make it zero indexed
+        let line_num = command["data"]["line_number"].as_u64().unwrap() as usize - 1;
         let value = command["data"]["lines"]["text"]
             .as_str()
             .unwrap()
             .to_owned();
 
-        let line = if let Some(match_range) = match_range {
-            Line::Match(Match {
-                match_type: MatchType::Arbitrary,
-                line_num,
-                match_range,
-                value,
-            })
-        } else {
-            Line::Context { line_num, value }
-        };
+        builder.lines.push(Line::new(line_num, value, submatches));
+    }
+}
 
-        found_match.lines.push(line)
+#[derive(Default)]
+struct MatchedFileBuilder {
+    file_path: String,
+    lines: Vec<Line>,
+}
+impl MatchedFileBuilder {
+    fn build(&mut self) -> MatchedFile {
+        MatchedFile::new(mem::take(&mut self.file_path), mem::take(&mut self.lines))
     }
 }

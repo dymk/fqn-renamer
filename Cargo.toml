@@ -1,13 +1,21 @@
 [package]
-name = "identrenamer"
+name = "fqn-renamer"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# "prod" use of dymk's for of tui-rs
+tui = { git = "https://github.com/dymk/tui-rs", rev = "fb75e90fc5feb1abbf122f3da86846a9428d7ef3" }
+
+# iterating on tip of dymk's fork of tui-rs
 # tui = { git = "https://github.com/dymk/tui-rs", branch = "dymk--interactive-form" }
-tui = { path = "../tui-rs" }
+
+# local development
+# tui = { path = "../tui-rs" }
+
 crossterm = "0.23"
 serde = "1.0"
 serde_derive = "1.0"
@@ -15,3 +23,5 @@ serde_json = "1.0"
 regex = "1"
 matches = "0.1"
 parking_lot = "0.12"
+itertools = "0.10"
+ropey = "1.5.0"
