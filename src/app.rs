@@ -1,10 +1,10 @@
-use std::{borrow::BorrowMut, error::Error, fs::File, io::BufWriter, mem};
+use std::{borrow::BorrowMut, error::Error, fs::File, io::BufWriter, mem, sync::mpsc::Sender};
 
 use tui::{interactive_form::InteractiveForm, widgets::TextInputState};
 
 use crate::{
-    event_log::EventLog, fqcn::Fqcn, fqcn_processor::process_matched_file_fqcn,
-    matched_file::MatchedFile, rg_worker::RgWorker,
+    controller::AppEvent, event_log::EventLog, fqcn::Fqcn,
+    fqcn_processor::process_matched_file_fqcn, matched_file::MatchedFile, rg_worker::RgWorker,
 };
 
 #[tui::macros::interactive_form]
@@ -31,6 +31,7 @@ pub struct App {
     pub show_events: bool,
     pub events: EventLog,
     search_state: SearchState,
+    events_sender: Sender<AppEvent>,
 
     pub results_scroll_offset: usize,
 
@@ -41,10 +42,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(base_dir: String) -> App {
+    pub fn new(base_dir: String, events_sender: Sender<AppEvent>) -> App {
         let mut ret = App {
             base_dir,
             search_state: SearchState::Idle,
+            events_sender,
             show_events: false,
             events: Default::default(),
             inputs: Default::default(),
@@ -59,7 +61,7 @@ impl App {
         ret
     }
 
-    pub fn check_search_done(&mut self) {
+    pub fn search_worker_finished(&mut self) {
         let mut results_changed = false;
 
         if matches!(self.search_state, SearchState::SearchingIdent) {
@@ -237,6 +239,7 @@ impl App {
     fn search_for_fqcn(&mut self, fqcn: Fqcn) {
         // find all files that reference the entire FQCN
         let fqcn_worker = RgWorker::new(
+            self.events_sender.clone(),
             "fqcn_worker",
             self.events.clone(),
             &[
@@ -277,6 +280,7 @@ impl App {
 
     fn search_for_raw_ident(&mut self, ident: String) {
         let rg_worker = RgWorker::new(
+            self.events_sender.clone(),
             "ident",
             self.events.clone(),
             &["--json", "-C1", &format!("\\b{}\\b", ident), &self.base_dir],

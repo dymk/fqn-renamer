@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::mem;
 use std::ops::Range;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::{
     error::Error,
@@ -11,6 +12,7 @@ use std::{
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 
+use crate::controller::AppEvent;
 use crate::event_log::EventLog;
 use crate::matched_file::{Line, MatchedFile};
 
@@ -23,7 +25,12 @@ pub struct RgWorker {
 }
 
 impl RgWorker {
-    pub fn new<S>(name: S, events: EventLog, args: &[&str]) -> Result<RgWorker, Box<dyn Error>>
+    pub fn new<S>(
+        events_sender: Sender<AppEvent>,
+        name: S,
+        events: EventLog,
+        args: &[&str],
+    ) -> Result<RgWorker, Box<dyn Error>>
     where
         S: Into<String>,
     {
@@ -38,6 +45,7 @@ impl RgWorker {
         let pid = process.id();
         let child_stdout = process.stdout.take().unwrap();
         let thread = thread::spawn(Self::worker_impl_factory(
+            events_sender,
             name.clone(),
             events,
             results.clone(),
@@ -88,6 +96,7 @@ impl RgWorker {
     }
 
     fn worker_impl_factory(
+        mut events_sender: Sender<AppEvent>,
         name: String,
         mut events: EventLog,
         matches: Arc<Mutex<Vec<MatchedFile>>>,
@@ -127,6 +136,7 @@ impl RgWorker {
                     if !command.is_empty() {
                         let command: Value = serde_json::from_str(command).unwrap();
                         Self::handle_command(
+                            &mut events_sender,
                             &name,
                             &mut in_progress_found,
                             &mut events,
@@ -149,6 +159,7 @@ impl RgWorker {
     }
 
     fn handle_command(
+        events_sender: &mut Sender<AppEvent>,
         name: &str,
         builder: &mut MatchedFileBuilder,
         events: &mut EventLog,
@@ -165,6 +176,7 @@ impl RgWorker {
             let found = builder.build();
             events.info(format!("rg {}: match in `{:?}`", name, found.file_path()));
             matches.lock().push(found);
+            events_sender.send(AppEvent::WorkerUpdate).unwrap();
         }
 
         if command["type"] == "context" {
